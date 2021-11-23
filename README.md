@@ -1,4 +1,9 @@
 # PatchCore anomaly detection
+20211123 Modified:
+
++update minor bugs during training
++add container
+
 Unofficial implementation of PatchCore(new SOTA) anomaly detection model
 
 
