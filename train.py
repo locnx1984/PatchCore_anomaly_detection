@@ -19,7 +19,7 @@ from sampling_methods.kcenter_greedy import kCenterGreedy
 from sklearn.random_projection import SparseRandomProjection
 from sklearn.neighbors import NearestNeighbors
 from scipy.ndimage import gaussian_filter
-
+import torchvision.models as models
 
 def distance_matrix(x, y=None, p=2):  # pairwise distance of vectors
 
@@ -31,8 +31,9 @@ def distance_matrix(x, y=None, p=2):  # pairwise distance of vectors
 
     x = x.unsqueeze(1).expand(n, m, d)
     y = y.unsqueeze(0).expand(n, m, d)
-
-    dist = torch.pow(x - y, p).sum(2)
+ 
+    # dist = torch.pow(x - y, p).sum(2)
+    dist = torch.cdist(x, y, p)
 
     return dist
 
@@ -243,7 +244,7 @@ class STPM(pl.LightningModule):
         def hook_t(module, input, output):
             self.features.append(output)
 
-        self.model = torch.hub.load('pytorch/vision:v0.9.0', 'wide_resnet50_2', pretrained=True)
+        self.model = models.wide_resnet50_2(pretrained=True)#torch.hub.load('pytorch/vision:0.10.0', 'wide_resnet50_2', pretrained=True)
 
         for param in self.model.parameters():
             param.requires_grad = False
@@ -418,7 +419,7 @@ def get_args():
     parser.add_argument('--batch_size', default=32)
     parser.add_argument('--load_size', default=256) # 256
     parser.add_argument('--input_size', default=224)
-    parser.add_argument('--coreset_sampling_ratio', default=0.001)
+    parser.add_argument('--coreset_sampling_ratio',type=float, default=0.001)
     parser.add_argument('--project_root_path', default=r'/home/changwoo/hdd/project_results/patchcore/test') # 'D:\Project_Train_Results\mvtec_anomaly_detection\210624\test') #
     parser.add_argument('--save_src_code', default=True)
     parser.add_argument('--save_anomaly_map', default=True)
