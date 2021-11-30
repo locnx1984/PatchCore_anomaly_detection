@@ -20,6 +20,7 @@ from sklearn.random_projection import SparseRandomProjection
 from sklearn.neighbors import NearestNeighbors
 from scipy.ndimage import gaussian_filter
 import torchvision.models as models
+import faiss
 
 def distance_matrix(x, y=None, p=2):  # pairwise distance of vectors
 
@@ -32,8 +33,8 @@ def distance_matrix(x, y=None, p=2):  # pairwise distance of vectors
     x = x.unsqueeze(1).expand(n, m, d)
     y = y.unsqueeze(0).expand(n, m, d)
  
-    # dist = torch.pow(x - y, p).sum(2)
-    dist = torch.cdist(x, y, p)
+    dist = torch.pow(x - y, p).sum(2)
+    # dist = torch.cdist(x, y, p)
 
     return dist
 
@@ -114,13 +115,20 @@ def embedding_concat(x, y):
     B, C1, H1, W1 = x.size()
     _, C2, H2, W2 = y.size()
     s = int(H1 / H2)
+    # print("1. x size=",x.size()) #1. x size= torch.Size([1, 512, 28, 28])
     x = F.unfold(x, kernel_size=s, dilation=1, stride=s)
+    # print("2. x size=",x.size()) #2. x size= torch.Size([1, 2048, 196])
     x = x.view(B, C1, -1, H2, W2)
+    # print("3. x size=",x.size()) #3. x size= torch.Size([1, 512, 4, 14, 14])
     z = torch.zeros(B, C1 + C2, x.size(2), H2, W2)
+    # print("4. z size=",z.size()) #4. z size= torch.Size([1, 1536, 4, 14, 14])
     for i in range(x.size(2)):
         z[:, :, i, :, :] = torch.cat((x[:, :, i, :, :], y), 1)
+    # print("5. z size=",z.size()) #5. z size= torch.Size([1, 1536, 4, 14, 14])
     z = z.view(B, -1, H2 * W2)
+    # print("6. z size=",z.size()) #6. z size= torch.Size([1, 6144, 196])
     z = F.fold(z, kernel_size=s, output_size=(H1, W1), stride=s)
+    # print("7. z size=",z.size()) #7. z size= torch.Size([1, 1536, 28, 28])
 
     return z
 
@@ -160,13 +168,16 @@ class MVTecDataset(Dataset):
         for defect_type in defect_types:
             if defect_type == 'good':
                 img_paths = glob.glob(os.path.join(self.img_path, defect_type) + "/*.png")
+                img_paths += glob.glob(os.path.join(self.img_path, defect_type) + "/*.jpg")
                 img_tot_paths.extend(img_paths)
                 gt_tot_paths.extend([0]*len(img_paths))
                 tot_labels.extend([0]*len(img_paths))
                 tot_types.extend(['good']*len(img_paths))
             else:
                 img_paths = glob.glob(os.path.join(self.img_path, defect_type) + "/*.png")
+                img_paths += glob.glob(os.path.join(self.img_path, defect_type) + "/*.jpg") 
                 gt_paths = glob.glob(os.path.join(self.gt_path, defect_type) + "/*.png")
+                gt_paths += glob.glob(os.path.join(self.gt_path, defect_type) + "/*.jpg")
                 img_paths.sort()
                 gt_paths.sort()
                 img_tot_paths.extend(img_paths)
@@ -183,8 +194,10 @@ class MVTecDataset(Dataset):
 
     def __getitem__(self, idx):
         img_path, gt, label, img_type = self.img_paths[idx], self.gt_paths[idx], self.labels[idx], self.types[idx]
-        img = Image.open(img_path).convert('RGB')
-        img = self.transform(img)
+         
+        img_original = Image.open(img_path)
+
+        img = self.transform(img_original.convert('RGB'))
         if gt == 0:
             gt = torch.zeros([1, img.size()[-2], img.size()[-2]])
         else:
@@ -192,8 +205,9 @@ class MVTecDataset(Dataset):
             gt = self.gt_transform(gt)
         
         assert img.size()[1:] == gt.size()[1:], "image.size != gt.size !!!"
-
-        return img, gt, label, os.path.basename(img_path[:-4]), img_type
+ 
+        img_original =transforms.ToTensor()(img_original).unsqueeze_(0)  
+        return img_original,img, gt, label, os.path.basename(img_path[:-4]), img_type
 
 
 def cvt2heatmap(gray):
@@ -202,7 +216,7 @@ def cvt2heatmap(gray):
 
 def heatmap_on_image(heatmap, image):
     if heatmap.shape != image.shape:
-        heatmap = cv2.resize(heatmap, (image.shape[0], image.shape[1]))
+        heatmap = cv2.resize(heatmap, (image.shape[1], image.shape[0]))
     out = np.float32(heatmap)/255 + np.float32(image)/255
     out = out / np.max(out)
     return np.uint8(255 * out)
@@ -210,6 +224,10 @@ def heatmap_on_image(heatmap, image):
 def min_max_norm(image):
     a_min, a_max = image.min(), image.max()
     return (image-a_min)/(a_max - a_min)    
+
+def min_max_norm2(image,good_thresh):
+    a_min, a_max = image.min(), image.max()
+    return (image-good_thresh)/(a_max - good_thresh)    
 
 
 def cal_confusion_matrix(y_true, y_pred_no_thresh, thresh, img_path_list):
@@ -269,6 +287,10 @@ class STPM(pl.LightningModule):
 
         self.inv_normalize = transforms.Normalize(mean=[-0.485/0.229, -0.456/0.224, -0.406/0.255], std=[1/0.229, 1/0.224, 1/0.255])
 
+        #faiss
+        self.knn=None
+        
+
     def init_results_list(self):
         self.gt_list_px_lvl = []
         self.pred_list_px_lvl = []
@@ -284,9 +306,9 @@ class STPM(pl.LightningModule):
         _ = self.model(x_t)
         return self.features
 
-    def save_anomaly_map(self, anomaly_map, input_img, gt_img, file_name, x_type):
+    def save_anomaly_map_original(self, anomaly_map, input_img, gt_img, file_name, x_type):
         if anomaly_map.shape != input_img.shape:
-            anomaly_map = cv2.resize(anomaly_map, (input_img.shape[0], input_img.shape[1]))
+            anomaly_map = cv2.resize(anomaly_map, (input_img.shape[1], input_img.shape[0]))
         anomaly_map_norm = min_max_norm(anomaly_map)
         anomaly_map_norm_hm = cvt2heatmap(anomaly_map_norm*255)
 
@@ -295,10 +317,50 @@ class STPM(pl.LightningModule):
         hm_on_img = heatmap_on_image(heatmap, input_img)
 
         # save images
+        print(f'{x_type}_{file_name}.jpg',input_img.shape,anomaly_map_norm_hm.shape,hm_on_img.shape,gt_img.shape)
         cv2.imwrite(os.path.join(self.sample_path, f'{x_type}_{file_name}.jpg'), input_img)
         cv2.imwrite(os.path.join(self.sample_path, f'{x_type}_{file_name}_amap.jpg'), anomaly_map_norm_hm)
         cv2.imwrite(os.path.join(self.sample_path, f'{x_type}_{file_name}_amap_on_img.jpg'), hm_on_img)
         cv2.imwrite(os.path.join(self.sample_path, f'{x_type}_{file_name}_gt.jpg'), gt_img)
+    def save_anomaly_map(self, raw_img, anomaly_map, input_img, gt_img, file_name, x_type):
+        print(self.sample_path, f'{x_type}_{file_name}:',"min,max error=",np.min(anomaly_map),np.max(anomaly_map))
+ 
+        if anomaly_map.shape != raw_img.shape:
+            anomaly_map = cv2.resize(anomaly_map, (raw_img.shape[1], raw_img.shape[0]))
+
+        #thresholding
+        max_err=np.max(anomaly_map)
+        min_err=np.min(anomaly_map)
+        anormal_thresh= (max_err-min_err)*0.00095+min_err
+        print("min,max,anormal_thresh=",min_err,max_err,anormal_thresh)
+        good_mask=(anomaly_map>anormal_thresh).astype(np.uint8)
+        anomaly_map = np.where(anomaly_map < anormal_thresh, anormal_thresh, anomaly_map)
+        anomaly_map_norm=np.zeros_like(anomaly_map)
+        if max_err>anormal_thresh:
+            anomaly_map_norm =  min_max_norm(anomaly_map) 
+
+
+        # anomaly map on image
+        heatmap = cvt2heatmap(anomaly_map_norm*255)  
+        heatmap= cv2.bitwise_and(heatmap,heatmap,mask = good_mask) 
+        img_heatmap_rgb = cv2.addWeighted(raw_img, 1, heatmap, 0.2, 0.) 
+        
+        #draw contour
+        contours, _ = cv2.findContours(good_mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+        i=0
+        for c in contours:
+            rect = cv2.boundingRect(c) 
+            x,y,w,h = rect
+            cv2.rectangle(img_heatmap_rgb,(x,y),(x+w,y+h),(0,0,255),3) 
+            i+=1
+            cv2.putText(img_heatmap_rgb,'Defect '+str(i),(x+w+10,y+h),0,1,(0,0,255))
+        # Draw all contours 
+        cv2.drawContours(img_heatmap_rgb, contours, -1, (0, 255, 255), 1)
+        
+        imgcombine = np.concatenate((raw_img, img_heatmap_rgb), axis=1) 
+        cv2.imwrite(os.path.join(self.sample_path, f'{x_type}_{file_name}_result.jpg'), imgcombine)
+        #cv2.imwrite(os.path.join(self.sample_path, f'{x_type}_{file_name}_mask.jpg'), good_mask*255)
+        
 
     def train_dataloader(self):
         image_datasets = MVTecDataset(root=os.path.join(args.dataset_path,args.category), transform=self.data_transforms, gt_transform=self.gt_transforms, phase='train')
@@ -317,29 +379,56 @@ class STPM(pl.LightningModule):
         self.model.eval() # to stop running_var move (maybe not critical)
         self.embedding_dir_path, self.sample_path, self.source_code_save_path = prep_dirs(self.logger.log_dir)
         self.embedding_list = []
+        print("==================on_train_start(self):============")
     
     def on_test_start(self):
         self.init_results_list()
         self.embedding_dir_path, self.sample_path, self.source_code_save_path = prep_dirs(self.logger.log_dir)
-        
-    def training_step(self, batch, batch_idx): # save locally aware patch features
-        x, _, _, file_name, _ = batch
+        print("==================on_test_start(self):============")
+        print("loading model...")
+        self.embedding_coreset = pickle.load(open(os.path.join(self.embedding_dir_path, 'embedding.pickle'), 'rb'))
+        print("loading model finished!",os.path.join(self.embedding_dir_path, 'embedding.pickle')) 
+
+        print("self.embedding_coreset size=",self.embedding_coreset.shape)  #(N=2344, feature=1536)
+        print("faiss size=int(self.embedding_coreset.shape[1])=",int(self.embedding_coreset.shape[1]))
+        #init faiss
+        self.knn = faiss.index_factory(int(self.embedding_coreset.shape[1]), "Flat")
+        self.knn.train(self.embedding_coreset.astype('float32'))
+        self.knn.add(self.embedding_coreset.astype('float32'))
+
+    def training_step(self, batch, batch_idx): # save locally aware patch features 
+        image_original,x, _, _, file_name, _ = batch
         features = self(x)
+        #print("features.shape=2",len(features))
+        
         embeddings = []
         for feature in features:
             m = torch.nn.AvgPool2d(3, 1, 1)
             embeddings.append(m(feature))
+            #print("(m(feature)).size()=", (m(feature)).size())#0:(m(feature)).size()= torch.Size([1, 512, 28, 28]) 1:(m(feature)).size()= torch.Size([1, 1024, 14, 14])
+        
         embedding = embedding_concat(embeddings[0], embeddings[1])
-        self.embedding_list.extend(reshape_embedding(np.array(embedding)))
+        #print("embedding(m(feature)).size()=", embedding.size())#embedding(m(feature)).size()= torch.Size([1, 1536, 28, 28])
+
+        self.embedding_list.extend(reshape_embedding(np.array(embedding))) #len(reshape_embedding(np.array(embedding)))=784
+        #print("self.embedding_list=",len(self.embedding_list))#self.embedding_list= 784
+        #print(len(batch), batch_idx,"training_step: embedding_list=",len(self.embedding_list))
 
     def training_epoch_end(self, outputs): 
+        print("LOG: training_epoch_end - len(self.embedding_list)=",len(self.embedding_list))
         total_embeddings = np.array(self.embedding_list)
         # Random projection
+        print("LOG: SparseRandomProjection...",total_embeddings.size)
         self.randomprojector = SparseRandomProjection(n_components='auto', eps=0.9) # 'auto' => Johnson-Lindenstrauss lemma
         self.randomprojector.fit(total_embeddings)
+        print("LOG: SparseRandomProjection...finished",total_embeddings.size)
         # Coreset Subsampling
+        print("LOG: kCenterGreedy...")
         selector = kCenterGreedy(total_embeddings,0,0)
+        print("LOG: select_batch...",total_embeddings.size)
+        #exit()
         selected_idx = selector.select_batch(model=self.randomprojector, already_selected=[], N=int(total_embeddings.shape[0]*args.coreset_sampling_ratio))
+        print("LOG: select_batch finished! selected_idx=",selected_idx)
         self.embedding_coreset = total_embeddings[selected_idx]
         
         print('initial embedding size : ', total_embeddings.shape)
@@ -347,9 +436,21 @@ class STPM(pl.LightningModule):
         with open(os.path.join(self.embedding_dir_path, 'embedding.pickle'), 'wb') as f:
             pickle.dump(self.embedding_coreset, f)
 
-    def test_step(self, batch, batch_idx): # Nearest Neighbour Search
+    def test_step(self, batch, batch_idx): # Nearest Neighbour Search 
+        '''
+        print("loading model...")
         self.embedding_coreset = pickle.load(open(os.path.join(self.embedding_dir_path, 'embedding.pickle'), 'rb'))
-        x, gt, label, file_name, x_type = batch
+        print("loading model finished!",os.path.join(self.embedding_dir_path, 'embedding.pickle')) 
+
+        print("self.embedding_coreset size=",self.embedding_coreset.shape)  #(N=2344, feature=1536)
+        print("faiss size=int(self.embedding_coreset.shape[1])=",int(self.embedding_coreset.shape[1]))
+        #init faiss
+        self.knn = faiss.index_factory(int(self.embedding_coreset.shape[1]), "Flat")
+        self.knn.train(self.embedding_coreset.astype('float32'))
+        self.knn.add(self.embedding_coreset.astype('float32'))
+        '''
+
+        image_original,x, gt, label, file_name, x_type = batch
         # extract embedding
         features = self(x)
         embeddings = []
@@ -362,11 +463,25 @@ class STPM(pl.LightningModule):
         #nbrs = NearestNeighbors(n_neighbors=args.n_neighbors, algorithm='ball_tree', metric='minkowski', p=2).fit(self.embedding_coreset)
         #score_patches, _ = nbrs.kneighbors(embedding_test)
         #
+        #-----------------------
         #Approximately 60x performance improvement
         #tack time 1.9070019721984863 -> 0.03699636459350586
-        knn = KNN(torch.from_numpy(self.embedding_coreset).cuda(), k=9)
-        score_patches = knn(torch.from_numpy(embedding_test).cuda())[0].cpu().detach().numpy()
-
+        import time
+        # start_knn=time.time()
+        # knn = KNN(torch.from_numpy(self.embedding_coreset).cuda(), k=9)
+        # score_patches = knn(torch.from_numpy(embedding_test).cuda())[0].cpu().detach().numpy()
+        # print("knn time=",time.time()-start_knn)
+        start_knn=time.time()
+        #print("score_patches shape=",score_patches.shape)
+        # #FAISS
+        # print("inference with faiss...")
+        print("embedding_test size=",embeddings[0].size(), embeddings[1].size(),embedding_test.shape)
+        # distances, neighbors = self.knn.search(embedding_test.reshape(1,-1).astype(np.float32), 9)
+        score_patches, _ = self.knn.search(np.ascontiguousarray(embedding_test.astype('float32')), 9)
+        print("faiss time=",time.time()-start_knn)
+        # print("result with faiss:",distances, neighbors)
+        #exit()
+        # #END FAISS
         anomaly_map = score_patches[:,0].reshape((28,28))
         N_b = score_patches[np.argmax(score_patches[:,0])]
         w = (1 - (np.max(np.exp(N_b))/np.sum(np.exp(N_b))))
@@ -383,12 +498,22 @@ class STPM(pl.LightningModule):
         self.img_path_list.extend(file_name)
         # save images
         x = self.inv_normalize(x)
-        input_x = cv2.cvtColor(x.permute(0,2,3,1).cpu().numpy()[0]*255, cv2.COLOR_BGR2RGB)
-        self.save_anomaly_map(anomaly_map_resized_blur, input_x, gt_np*255, file_name[0], x_type[0])
+ 
+        input_x = cv2.cvtColor(x.permute(0,2,3,1).cpu().numpy()[0]*255, cv2.COLOR_BGR2RGB)  
+        image_original2= transforms.ToPILImage()(image_original.squeeze_(0).squeeze_(0))
+        cvImage = cv2.cvtColor(np.array(image_original2), cv2.COLOR_RGB2BGR) 
+         
+        self.save_anomaly_map(cvImage,anomaly_map_resized_blur, input_x, gt_np*255, file_name[0], x_type[0])
+        #exit()
 
     def test_epoch_end(self, outputs):
-        print("Total pixel-level auc-roc score :")
-        pixel_auc = roc_auc_score(self.gt_list_px_lvl, self.pred_list_px_lvl)
+        print("Total pixel-level auc-roc score :") 
+        pixel_auc=0
+        try:
+            pixel_auc = roc_auc_score(self.gt_list_px_lvl, self.pred_list_px_lvl)
+        except ValueError:
+            pass
+        
         print(pixel_auc)
         print("Total image-level auc-roc score :")
         img_auc = roc_auc_score(self.gt_list_img_lvl, self.pred_list_img_lvl)
@@ -413,14 +538,14 @@ class STPM(pl.LightningModule):
 def get_args():
     parser = argparse.ArgumentParser(description='ANOMALYDETECTION')
     parser.add_argument('--phase', choices=['train','test'], default='train')
-    parser.add_argument('--dataset_path', default=r'/home/changwoo/hdd/datasets/mvtec_anomaly_detection') # 'D:\Dataset\mvtec_anomaly_detection')#
+    parser.add_argument('--dataset_path', default=r'/home/solomon/public/Loc/mvtec_anomaly_detection') # 'D:\Dataset\mvtec_anomaly_detection')#
     parser.add_argument('--category', default='carpet')
     parser.add_argument('--num_epochs', default=1)
-    parser.add_argument('--batch_size', default=32)
+    parser.add_argument('--batch_size', default=32)#32
     parser.add_argument('--load_size', default=256) # 256
     parser.add_argument('--input_size', default=224)
-    parser.add_argument('--coreset_sampling_ratio',type=float, default=0.001)
-    parser.add_argument('--project_root_path', default=r'/home/changwoo/hdd/project_results/patchcore/test') # 'D:\Project_Train_Results\mvtec_anomaly_detection\210624\test') #
+    parser.add_argument('--coreset_sampling_ratio',type=float, default=0.01)
+    parser.add_argument('--project_root_path', default=r'/home/solomon/public/Loc/results') # 'D:\Project_Train_Results\mvtec_anomaly_detection\210624\test') #
     parser.add_argument('--save_src_code', default=True)
     parser.add_argument('--save_anomaly_map', default=True)
     parser.add_argument('--n_neighbors', type=int, default=9)
