@@ -21,67 +21,7 @@ from sklearn.neighbors import NearestNeighbors
 from scipy.ndimage import gaussian_filter
 import torchvision.models as models
 import faiss
-
-def distance_matrix(x, y=None, p=2):  # pairwise distance of vectors
-
-    y = x if type(y) == type(None) else y
-
-    n = x.size(0)
-    m = y.size(0)
-    d = x.size(1)
-
-    x = x.unsqueeze(1).expand(n, m, d)
-    y = y.unsqueeze(0).expand(n, m, d)
- 
-    dist = torch.pow(x - y, p).sum(2)
-    # dist = torch.cdist(x, y, p)
-
-    return dist
-
-
-class NN():
-
-    def __init__(self, X=None, Y=None, p=2):
-        self.p = p
-        self.train(X, Y)
-
-    def train(self, X, Y):
-        self.train_pts = X
-        self.train_label = Y
-
-    def __call__(self, x):
-        return self.predict(x)
-
-    def predict(self, x):
-        if type(self.train_pts) == type(None) or type(self.train_label) == type(None):
-            name = self.__class__.__name__
-            raise RuntimeError(f"{name} wasn't trained. Need to execute {name}.train() first")
-
-        dist = distance_matrix(x, self.train_pts, self.p) ** (1 / self.p)
-        labels = torch.argmin(dist, dim=1)
-        return self.train_label[labels]
-
-class KNN(NN):
-
-    def __init__(self, X=None, Y=None, k=3, p=2):
-        self.k = k
-        super().__init__(X, Y, p)
-
-    def train(self, X, Y):
-        super().train(X, Y)
-        if type(Y) != type(None):
-            self.unique_labels = self.train_label.unique()
-
-    def predict(self, x):
-
-
-        dist = distance_matrix(x, self.train_pts, self.p) ** (1 / self.p)
-
-        knn = dist.topk(self.k, largest=False)
-
-
-        return knn
-
+import time 
 
 def copy_files(src, dst, ignores=[]):
     src_files = os.listdir(src)
@@ -228,8 +168,7 @@ def min_max_norm(image):
 def min_max_norm2(image,good_thresh):
     a_min, a_max = image.min(), image.max()
     return (image-good_thresh)/(a_max - good_thresh)    
-
-
+ 
 def cal_confusion_matrix(y_true, y_pred_no_thresh, thresh, img_path_list):
     pred_thresh = []
     false_n = []
@@ -250,7 +189,7 @@ def cal_confusion_matrix(y_true, y_pred_no_thresh, thresh, img_path_list):
     print(false_p)
     print('false negative')
     print(false_n)
-    
+     
 
 class STPM(pl.LightningModule):
     def __init__(self, hparams):
@@ -305,23 +244,7 @@ class STPM(pl.LightningModule):
         self.init_features()
         _ = self.model(x_t)
         return self.features
-
-    def save_anomaly_map_original(self, anomaly_map, input_img, gt_img, file_name, x_type):
-        if anomaly_map.shape != input_img.shape:
-            anomaly_map = cv2.resize(anomaly_map, (input_img.shape[1], input_img.shape[0]))
-        anomaly_map_norm = min_max_norm(anomaly_map)
-        anomaly_map_norm_hm = cvt2heatmap(anomaly_map_norm*255)
-
-        # anomaly map on image
-        heatmap = cvt2heatmap(anomaly_map_norm*255)
-        hm_on_img = heatmap_on_image(heatmap, input_img)
-
-        # save images
-        print(f'{x_type}_{file_name}.jpg',input_img.shape,anomaly_map_norm_hm.shape,hm_on_img.shape,gt_img.shape)
-        cv2.imwrite(os.path.join(self.sample_path, f'{x_type}_{file_name}.jpg'), input_img)
-        cv2.imwrite(os.path.join(self.sample_path, f'{x_type}_{file_name}_amap.jpg'), anomaly_map_norm_hm)
-        cv2.imwrite(os.path.join(self.sample_path, f'{x_type}_{file_name}_amap_on_img.jpg'), hm_on_img)
-        cv2.imwrite(os.path.join(self.sample_path, f'{x_type}_{file_name}_gt.jpg'), gt_img)
+ 
     def save_anomaly_map(self, raw_img, anomaly_map, input_img, gt_img, file_name, x_type):
         print(self.sample_path, f'{x_type}_{file_name}:',"min,max error=",np.min(anomaly_map),np.max(anomaly_map))
  
@@ -331,15 +254,18 @@ class STPM(pl.LightningModule):
         #thresholding
         max_err=np.max(anomaly_map)
         min_err=np.min(anomaly_map)
+
+        #auto thresholding
         anormal_thresh= (max_err-min_err)*0.00095+min_err
         print("min,max,anormal_thresh=",min_err,max_err,anormal_thresh)
+        
+        #extract mask
         good_mask=(anomaly_map>anormal_thresh).astype(np.uint8)
         anomaly_map = np.where(anomaly_map < anormal_thresh, anormal_thresh, anomaly_map)
         anomaly_map_norm=np.zeros_like(anomaly_map)
         if max_err>anormal_thresh:
             anomaly_map_norm =  min_max_norm(anomaly_map) 
-
-
+ 
         # anomaly map on image
         heatmap = cvt2heatmap(anomaly_map_norm*255)  
         heatmap= cv2.bitwise_and(heatmap,heatmap,mask = good_mask) 
@@ -360,8 +286,7 @@ class STPM(pl.LightningModule):
         imgcombine = np.concatenate((raw_img, img_heatmap_rgb), axis=1) 
         cv2.imwrite(os.path.join(self.sample_path, f'{x_type}_{file_name}_result.jpg'), imgcombine)
         #cv2.imwrite(os.path.join(self.sample_path, f'{x_type}_{file_name}_mask.jpg'), good_mask*255)
-        
-
+         
     def train_dataloader(self):
         image_datasets = MVTecDataset(root=os.path.join(args.dataset_path,args.category), transform=self.data_transforms, gt_transform=self.gt_transforms, phase='train')
         train_loader = DataLoader(image_datasets, batch_size=args.batch_size, shuffle=True, num_workers=0) #, pin_memory=True)
@@ -436,20 +361,7 @@ class STPM(pl.LightningModule):
         with open(os.path.join(self.embedding_dir_path, 'embedding.pickle'), 'wb') as f:
             pickle.dump(self.embedding_coreset, f)
 
-    def test_step(self, batch, batch_idx): # Nearest Neighbour Search 
-        '''
-        print("loading model...")
-        self.embedding_coreset = pickle.load(open(os.path.join(self.embedding_dir_path, 'embedding.pickle'), 'rb'))
-        print("loading model finished!",os.path.join(self.embedding_dir_path, 'embedding.pickle')) 
-
-        print("self.embedding_coreset size=",self.embedding_coreset.shape)  #(N=2344, feature=1536)
-        print("faiss size=int(self.embedding_coreset.shape[1])=",int(self.embedding_coreset.shape[1]))
-        #init faiss
-        self.knn = faiss.index_factory(int(self.embedding_coreset.shape[1]), "Flat")
-        self.knn.train(self.embedding_coreset.astype('float32'))
-        self.knn.add(self.embedding_coreset.astype('float32'))
-        '''
-
+    def test_step(self, batch, batch_idx): # Nearest Neighbour Search  
         image_original,x, gt, label, file_name, x_type = batch
         # extract embedding
         features = self(x)
@@ -459,29 +371,14 @@ class STPM(pl.LightningModule):
             embeddings.append(m(feature))
         embedding_ = embedding_concat(embeddings[0], embeddings[1])
         embedding_test = np.array(reshape_embedding(np.array(embedding_)))
-        # NN
-        #nbrs = NearestNeighbors(n_neighbors=args.n_neighbors, algorithm='ball_tree', metric='minkowski', p=2).fit(self.embedding_coreset)
-        #score_patches, _ = nbrs.kneighbors(embedding_test)
-        #
-        #-----------------------
-        #Approximately 60x performance improvement
-        #tack time 1.9070019721984863 -> 0.03699636459350586
-        import time
-        # start_knn=time.time()
-        # knn = KNN(torch.from_numpy(self.embedding_coreset).cuda(), k=9)
-        # score_patches = knn(torch.from_numpy(embedding_test).cuda())[0].cpu().detach().numpy()
-        # print("knn time=",time.time()-start_knn)
+         
+        # #FAISS 
+        print("embedding_test size=",embeddings[0].size(), embeddings[1].size(),embedding_test.shape) 
         start_knn=time.time()
-        #print("score_patches shape=",score_patches.shape)
-        # #FAISS
-        # print("inference with faiss...")
-        print("embedding_test size=",embeddings[0].size(), embeddings[1].size(),embedding_test.shape)
-        # distances, neighbors = self.knn.search(embedding_test.reshape(1,-1).astype(np.float32), 9)
         score_patches, _ = self.knn.search(np.ascontiguousarray(embedding_test.astype('float32')), 9)
-        print("faiss time=",time.time()-start_knn)
-        # print("result with faiss:",distances, neighbors)
-        #exit()
-        # #END FAISS
+        print("faiss time=",time.time()-start_knn) 
+        #exit() 
+
         anomaly_map = score_patches[:,0].reshape((28,28))
         N_b = score_patches[np.argmax(score_patches[:,0])]
         w = (1 - (np.max(np.exp(N_b))/np.sum(np.exp(N_b))))
